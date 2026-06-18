@@ -236,7 +236,7 @@ End Function
 Private Function IsTargetBaseName(ByVal baseName As String) As Boolean
     Dim re As Object
     Set re = CreateObject("VBScript.RegExp")
-    re.Pattern = "(^|[^0-9A-Za-z])((?:[1-5]|7)-\d{1,3}|[1-5](?!-))(?=$|[^0-9A-Za-z])"
+    re.Pattern = "^((?:[1-5]|7)-\d{1,3}|[1-5](?!-))(?=$|[^0-9A-Za-z])"
     re.Global = False
     re.IgnoreCase = False
     IsTargetBaseName = re.Test(baseName)
