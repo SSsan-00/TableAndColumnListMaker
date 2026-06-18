@@ -1,0 +1,15 @@
+# Excel temporary files
+~$*
+*.tmp
+
+# Local build / generated output
+dist/
+build/
+out/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
