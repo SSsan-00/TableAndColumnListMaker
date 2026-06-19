@@ -9,6 +9,7 @@ Private Type RunStats
     MatchedFileCount As Long
     ProcessedWorkbookCount As Long
     SkippedWorkbookCount As Long
+    SkippedFolderCount As Long
     TableCount As Long
     ColumnCount As Long
 End Type
@@ -36,12 +37,16 @@ Public Sub RunTableAndColumnListMakerForFolder(ByVal targetFolder As String, Opt
     Dim oldEnableEvents As Boolean
     Dim oldDisplayAlerts As Boolean
     Dim oldStatusBar As Variant
+    Dim oldAskToUpdateLinks As Boolean
+    Dim oldAutomationSecurity As MsoAutomationSecurity
     Dim oldCalculation As XlCalculation
 
     oldScreenUpdating = Application.ScreenUpdating
     oldEnableEvents = Application.EnableEvents
     oldDisplayAlerts = Application.DisplayAlerts
     oldStatusBar = Application.StatusBar
+    oldAskToUpdateLinks = Application.AskToUpdateLinks
+    oldAutomationSecurity = Application.AutomationSecurity
     oldCalculation = Application.Calculation
 
     On Error GoTo FatalError
@@ -49,6 +54,8 @@ Public Sub RunTableAndColumnListMakerForFolder(ByVal targetFolder As String, Opt
     Application.ScreenUpdating = False
     Application.EnableEvents = False
     Application.DisplayAlerts = False
+    Application.AskToUpdateLinks = False
+    Application.AutomationSecurity = msoAutomationSecurityForceDisable
     Application.Calculation = xlCalculationManual
     Application.StatusBar = "Preparing analysis..."
 
@@ -77,7 +84,10 @@ Public Sub RunTableAndColumnListMakerForFolder(ByVal targetFolder As String, Opt
         Err.Raise vbObjectError + 100, "RunTableAndColumnListMaker", "Folder not found: " & targetFolder
     End If
 
-    ProcessFolder fso.GetFolder(targetFolder), tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
+    Dim targetFiles As Collection
+    Set targetFiles = CollectTargetWorkbookFiles(targetFolder, stats)
+
+    ProcessWorkbookFiles targetFiles, tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
 
     stats.TableCount = nextTableRow - 2
     stats.ColumnCount = nextColumnRow - 2
@@ -92,6 +102,8 @@ Public Sub RunTableAndColumnListMakerForFolder(ByVal targetFolder As String, Opt
 CleanExit:
     Application.StatusBar = oldStatusBar
     Application.Calculation = oldCalculation
+    Application.AutomationSecurity = oldAutomationSecurity
+    Application.AskToUpdateLinks = oldAskToUpdateLinks
     Application.DisplayAlerts = oldDisplayAlerts
     Application.EnableEvents = oldEnableEvents
     Application.ScreenUpdating = oldScreenUpdating
@@ -109,6 +121,8 @@ FatalError:
 RestoreAfterFatalError:
     Application.StatusBar = oldStatusBar
     Application.Calculation = oldCalculation
+    Application.AutomationSecurity = oldAutomationSecurity
+    Application.AskToUpdateLinks = oldAskToUpdateLinks
     Application.DisplayAlerts = oldDisplayAlerts
     Application.EnableEvents = oldEnableEvents
     Application.ScreenUpdating = oldScreenUpdating
@@ -135,28 +149,87 @@ Private Function PickTargetFolder() As String
     End With
 End Function
 
-Private Sub ProcessFolder( _
-    ByVal folder As Object, _
+Private Function CollectTargetWorkbookFiles(ByVal rootFolderPath As String, ByRef stats As RunStats) As Collection
+    Dim targetFiles As New Collection
+    Dim folders As New Collection
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    folders.Add rootFolderPath
+
+    Do While folders.Count > 0
+        Dim folderPath As String
+        folderPath = CStr(folders(1))
+        folders.Remove 1
+
+        Dim folder As Object
+        On Error Resume Next
+        Set folder = fso.GetFolder(folderPath)
+        If Err.Number <> 0 Then
+            stats.SkippedFolderCount = stats.SkippedFolderCount + 1
+            Err.Clear
+            On Error GoTo 0
+            GoTo ContinueFolderLoop
+        End If
+        On Error GoTo 0
+
+        Dim file As Object
+        On Error Resume Next
+        For Each file In folder.Files
+            If Err.Number <> 0 Then
+                stats.SkippedFolderCount = stats.SkippedFolderCount + 1
+                Err.Clear
+                Exit For
+            End If
+
+            stats.ScannedFileCount = stats.ScannedFileCount + 1
+            If IsTargetWorkbookFile(CStr(file.Path)) Then
+                stats.MatchedFileCount = stats.MatchedFileCount + 1
+                targetFiles.Add CStr(file.Path)
+            End If
+        Next file
+        On Error GoTo 0
+
+        Dim subFolder As Object
+        On Error Resume Next
+        For Each subFolder In folder.SubFolders
+            If Err.Number <> 0 Then
+                stats.SkippedFolderCount = stats.SkippedFolderCount + 1
+                Err.Clear
+                Exit For
+            End If
+            folders.Add CStr(subFolder.Path)
+        Next subFolder
+        On Error GoTo 0
+
+ContinueFolderLoop:
+        If stats.ScannedFileCount Mod 100 = 0 Then
+            Application.StatusBar = "Scanning files: " & CStr(stats.ScannedFileCount)
+            DoEvents
+        End If
+    Loop
+
+    Set CollectTargetWorkbookFiles = targetFiles
+End Function
+
+Private Sub ProcessWorkbookFiles( _
+    ByVal targetFiles As Collection, _
     ByVal tableListSheet As Worksheet, _
     ByVal columnListSheet As Worksheet, _
     ByRef nextTableRow As Long, _
     ByRef nextColumnRow As Long, _
     ByRef stats As RunStats)
 
-    Dim file As Object
-    For Each file In folder.Files
-        stats.ScannedFileCount = stats.ScannedFileCount + 1
-        If IsTargetWorkbookFile(CStr(file.Path)) Then
-            stats.MatchedFileCount = stats.MatchedFileCount + 1
-            Application.StatusBar = "Analyzing: " & CStr(file.Path)
-            ProcessWorkbook CStr(file.Path), tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
-        End If
-    Next file
+    Dim index As Long
+    For index = 1 To targetFiles.Count
+        Application.StatusBar = "Analyzing " & CStr(index) & " / " & CStr(targetFiles.Count) & ": " & CStr(targetFiles(index))
+        ProcessWorkbook CStr(targetFiles(index)), tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
 
-    Dim subFolder As Object
-    For Each subFolder In folder.SubFolders
-        ProcessFolder subFolder, tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
-    Next subFolder
+        If index Mod 10 = 0 Then
+            Application.CutCopyMode = False
+            DoEvents
+        End If
+    Next index
 End Sub
 
 Private Sub ProcessWorkbook( _
@@ -175,7 +248,11 @@ Private Sub ProcessWorkbook( _
         UpdateLinks:=0, _
         ReadOnly:=True, _
         AddToMru:=False, _
-        IgnoreReadOnlyRecommended:=True)
+        Password:="", _
+        WriteResPassword:="", _
+        IgnoreReadOnlyRecommended:=True, _
+        Notify:=False, _
+        CorruptLoad:=xlRepairFile)
 
     If sourceBook.Worksheets.Count = 0 Then
         Err.Raise vbObjectError + 101, "ProcessWorkbook", "No worksheet found."
@@ -245,8 +322,8 @@ End Function
 Private Function ResolveEnglishTableName(ByVal sourceSheet As Worksheet) As String
     Dim c1Value As String
     Dim b2Value As String
-    c1Value = TrimCellText(sourceSheet.Range("C1").Value)
-    b2Value = TrimCellText(sourceSheet.Range("B2").Value)
+    c1Value = TrimRangeText(sourceSheet.Range("C1"))
+    b2Value = TrimRangeText(sourceSheet.Range("B2"))
 
     If Len(c1Value) = 0 And Len(b2Value) = 0 Then
         ResolveEnglishTableName = UnresolvedValue()
@@ -352,16 +429,11 @@ Private Sub ParseSheetName(ByVal sheetName As String, ByRef japaneseName As Stri
     Set tokens = TokenizeSheetName(sheetName)
 
     Dim japaneseParts As New Collection
-    Dim bestTableId As String
     Dim token As Variant
 
     For Each token In tokens
         If ContainsJapanese(CStr(token)) Then
             japaneseParts.Add CStr(token)
-        ElseIf IsTableIdToken(CStr(token)) Then
-            If Len(CStr(token)) > Len(bestTableId) Then
-                bestTableId = CStr(token)
-            End If
         End If
     Next token
 
@@ -370,11 +442,28 @@ Private Sub ParseSheetName(ByVal sheetName As String, ByRef japaneseName As Stri
         japaneseName = UnresolvedValue()
     End If
 
-    tableId = bestTableId
+    tableId = ExtractFirstDigitSequence(sheetName)
     If Len(tableId) = 0 Then
         tableId = UnresolvedValue()
     End If
 End Sub
+
+Private Function ExtractFirstDigitSequence(ByVal value As String) As String
+    Dim index As Long
+    Dim started As Boolean
+    Dim currentChar As String
+
+    For index = 1 To Len(value)
+        currentChar = Mid$(value, index, 1)
+
+        If IsDigitChar(currentChar) Then
+            ExtractFirstDigitSequence = ExtractFirstDigitSequence & NormalizeDigitChar(currentChar)
+            started = True
+        ElseIf started Then
+            Exit Function
+        End If
+    Next index
+End Function
 
 Private Function TokenizeSheetName(ByVal sheetName As String) As Collection
     Dim tokens As New Collection
@@ -487,6 +576,36 @@ Private Function IsAsciiAlphaNumeric(ByVal value As String) As Boolean
         (codePoint >= AscW("a") And codePoint <= AscW("z"))
 End Function
 
+Private Function IsDigitChar(ByVal value As String) As Boolean
+    If Len(value) = 0 Then
+        Exit Function
+    End If
+
+    Dim codePoint As Long
+    codePoint = AscW(Left$(value, 1))
+    If codePoint < 0 Then
+        codePoint = codePoint + 65536
+    End If
+
+    IsDigitChar = _
+        (codePoint >= AscW("0") And codePoint <= AscW("9")) Or _
+        (codePoint >= 65296 And codePoint <= 65305)
+End Function
+
+Private Function NormalizeDigitChar(ByVal value As String) As String
+    Dim codePoint As Long
+    codePoint = AscW(Left$(value, 1))
+    If codePoint < 0 Then
+        codePoint = codePoint + 65536
+    End If
+
+    If codePoint >= 65296 And codePoint <= 65305 Then
+        NormalizeDigitChar = Chr$(codePoint - 65296 + AscW("0"))
+    Else
+        NormalizeDigitChar = Left$(value, 1)
+    End If
+End Function
+
 Private Function IsAsciiLetter(ByVal value As String) As Boolean
     If Len(value) = 0 Then
         Exit Function
@@ -521,6 +640,14 @@ Private Function TrimCellText(ByVal value As Variant) As String
         TrimCellText = vbNullString
     Else
         TrimCellText = Trim$(CStr(value))
+    End If
+End Function
+
+Private Function TrimRangeText(ByVal targetRange As Range) As String
+    If targetRange.MergeCells Then
+        TrimRangeText = TrimCellText(targetRange.MergeArea.Cells(1, 1).Value)
+    Else
+        TrimRangeText = TrimCellText(targetRange.Value)
     End If
 End Function
 
@@ -693,6 +820,7 @@ Private Function BuildCompletionMessage(ByRef stats As RunStats) As String
         "Matched files: " & CStr(stats.MatchedFileCount) & vbCrLf & _
         "Processed workbooks: " & CStr(stats.ProcessedWorkbookCount) & vbCrLf & _
         "Skipped workbooks: " & CStr(stats.SkippedWorkbookCount) & vbCrLf & _
+        "Skipped folders: " & CStr(stats.SkippedFolderCount) & vbCrLf & _
         "Table rows: " & CStr(stats.TableCount) & vbCrLf & _
         "Column rows: " & CStr(stats.ColumnCount)
 End Function
