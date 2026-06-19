@@ -3,6 +3,9 @@ Option Explicit
 
 Private Const ERROR_VALUE As String = "ERROR"
 Private Const SEARCH_FORMULA_LAST_ROW As Long = 1000
+Private Const OUTPUT_FLUSH_ROW_COUNT As Long = 5000
+Private Const SCAN_YIELD_INTERVAL As Long = 100
+Private Const WORKBOOK_YIELD_INTERVAL As Long = 10
 
 Private Type RunStats
     ScannedFileCount As Long
@@ -203,7 +206,7 @@ Private Function CollectTargetWorkbookFiles(ByVal rootFolderPath As String, ByRe
         On Error GoTo 0
 
 ContinueFolderLoop:
-        If stats.ScannedFileCount Mod 100 = 0 Then
+        If stats.ScannedFileCount Mod SCAN_YIELD_INTERVAL = 0 Then
             Application.StatusBar = "Scanning files: " & CStr(stats.ScannedFileCount)
             DoEvents
         End If
@@ -220,27 +223,46 @@ Private Sub ProcessWorkbookFiles( _
     ByRef nextColumnRow As Long, _
     ByRef stats As RunStats)
 
+    Dim tableRows As Collection
+    Dim columnRows As Collection
+    Set tableRows = New Collection
+    Set columnRows = New Collection
+
     Dim index As Long
     For index = 1 To targetFiles.Count
         Application.StatusBar = "Analyzing " & CStr(index) & " / " & CStr(targetFiles.Count) & ": " & CStr(targetFiles(index))
-        ProcessWorkbook CStr(targetFiles(index)), tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
+        ProcessWorkbook CStr(targetFiles(index)), tableRows, columnRows, stats
 
-        If index Mod 10 = 0 Then
+        If tableRows.Count >= OUTPUT_FLUSH_ROW_COUNT Then
+            FlushBufferedRows tableRows, tableListSheet, 3, nextTableRow
+        End If
+
+        If columnRows.Count >= OUTPUT_FLUSH_ROW_COUNT Then
+            FlushBufferedRows columnRows, columnListSheet, 4, nextColumnRow
+        End If
+
+        If index Mod WORKBOOK_YIELD_INTERVAL = 0 Then
             Application.CutCopyMode = False
             DoEvents
         End If
     Next index
+
+    FlushBufferedRows tableRows, tableListSheet, 3, nextTableRow
+    FlushBufferedRows columnRows, columnListSheet, 4, nextColumnRow
 End Sub
 
 Private Sub ProcessWorkbook( _
     ByVal workbookPath As String, _
-    ByVal tableListSheet As Worksheet, _
-    ByVal columnListSheet As Worksheet, _
-    ByRef nextTableRow As Long, _
-    ByRef nextColumnRow As Long, _
+    ByVal tableRows As Collection, _
+    ByVal columnRows As Collection, _
     ByRef stats As RunStats)
 
     Dim sourceBook As Workbook
+    Dim sourceSheet As Worksheet
+    Dim workbookTableRows As Collection
+    Dim workbookColumnRows As Collection
+    Set workbookTableRows = New Collection
+    Set workbookColumnRows = New Collection
 
     On Error GoTo WorkbookError
     Set sourceBook = Workbooks.Open( _
@@ -258,7 +280,6 @@ Private Sub ProcessWorkbook( _
         Err.Raise vbObjectError + 101, "ProcessWorkbook", "No worksheet found."
     End If
 
-    Dim sourceSheet As Worksheet
     Set sourceSheet = sourceBook.Worksheets(1)
 
     Dim englishTableName As String
@@ -268,20 +289,22 @@ Private Sub ProcessWorkbook( _
     Dim tableId As String
     ParseSheetName sourceSheet.Name, japaneseTableName, tableId
 
-    tableListSheet.Cells(nextTableRow, 1).Value = englishTableName
-    tableListSheet.Cells(nextTableRow, 2).Value = japaneseTableName
-    tableListSheet.Cells(nextTableRow, 3).Value = tableId
-    nextTableRow = nextTableRow + 1
+    AddBufferedRow workbookTableRows, englishTableName, japaneseTableName, tableId
 
-    WriteColumnRows sourceSheet, columnListSheet, englishTableName, nextColumnRow
+    CollectColumnRows sourceSheet, workbookColumnRows, englishTableName
+
+    AppendBufferedRows workbookTableRows, tableRows
+    AppendBufferedRows workbookColumnRows, columnRows
 
     stats.ProcessedWorkbookCount = stats.ProcessedWorkbookCount + 1
 
 CleanWorkbook:
     On Error Resume Next
+    Set sourceSheet = Nothing
     If Not sourceBook Is Nothing Then
         sourceBook.Close SaveChanges:=False
     End If
+    Set sourceBook = Nothing
     On Error GoTo 0
     Exit Sub
 
@@ -334,11 +357,10 @@ Private Function ResolveEnglishTableName(ByVal sourceSheet As Worksheet) As Stri
     End If
 End Function
 
-Private Sub WriteColumnRows( _
+Private Sub CollectColumnRows( _
     ByVal sourceSheet As Worksheet, _
-    ByVal columnListSheet As Worksheet, _
-    ByVal englishTableName As String, _
-    ByRef nextColumnRow As Long)
+    ByVal columnRows As Collection, _
+    ByVal englishTableName As String)
 
     Dim fieldHeaderCell As Range
     Set fieldHeaderCell = FindFieldHeaderCell(sourceSheet)
@@ -359,18 +381,17 @@ Private Sub WriteColumnRows( _
         Exit Sub
     End If
 
+    Dim values As Variant
+    values = sourceSheet.Range(sourceSheet.Cells(headerRow + 1, fieldColumn), sourceSheet.Cells(lastRow, japaneseColumn)).Value2
+
     Dim rowIndex As Long
     Dim fieldName As String
     Dim japaneseName As String
-    For rowIndex = headerRow + 1 To lastRow
-        fieldName = TrimCellText(sourceSheet.Cells(rowIndex, fieldColumn).Value)
+    For rowIndex = 1 To UBound(values, 1)
+        fieldName = TrimCellText(values(rowIndex, 1))
         If Len(fieldName) > 0 Then
-            japaneseName = TrimCellText(sourceSheet.Cells(rowIndex, japaneseColumn).Value)
-            columnListSheet.Cells(nextColumnRow, 1).Value = englishTableName
-            columnListSheet.Cells(nextColumnRow, 2).Value = fieldName
-            columnListSheet.Cells(nextColumnRow, 3).Value = japaneseName
-            columnListSheet.Cells(nextColumnRow, 4).Value = BuildColumnLookupKey(englishTableName, fieldName)
-            nextColumnRow = nextColumnRow + 1
+            japaneseName = TrimCellText(values(rowIndex, 2))
+            AddBufferedRow columnRows, englishTableName, fieldName, japaneseName, BuildColumnLookupKey(englishTableName, fieldName)
         End If
     Next rowIndex
 End Sub
@@ -606,35 +627,6 @@ Private Function NormalizeDigitChar(ByVal value As String) As String
     End If
 End Function
 
-Private Function IsAsciiLetter(ByVal value As String) As Boolean
-    If Len(value) = 0 Then
-        Exit Function
-    End If
-
-    Dim codePoint As Long
-    codePoint = AscW(Left$(value, 1))
-    IsAsciiLetter = _
-        (codePoint >= AscW("A") And codePoint <= AscW("Z")) Or _
-        (codePoint >= AscW("a") And codePoint <= AscW("z"))
-End Function
-
-Private Function IsTableIdToken(ByVal value As String) As Boolean
-    Dim hasLetter As Boolean
-    Dim index As Long
-
-    For index = 1 To Len(value)
-        Dim currentChar As String
-        currentChar = Mid$(value, index, 1)
-        If IsAsciiLetter(currentChar) Then
-            hasLetter = True
-        ElseIf Not IsAsciiAlphaNumeric(currentChar) And currentChar <> "_" Then
-            Exit Function
-        End If
-    Next index
-
-    IsTableIdToken = hasLetter
-End Function
-
 Private Function TrimCellText(ByVal value As Variant) As String
     If IsError(value) Or IsNull(value) Or IsEmpty(value) Then
         TrimCellText = vbNullString
@@ -739,6 +731,52 @@ End Function
 Private Function BuildColumnLookupKey(ByVal englishTableName As String, ByVal englishColumnName As String) As String
     BuildColumnLookupKey = Trim$(englishTableName) & "|" & Trim$(englishColumnName)
 End Function
+
+Private Sub AddBufferedRow(ByVal rowBuffer As Collection, ParamArray values() As Variant)
+    Dim rowValues As Variant
+    rowValues = values
+    rowBuffer.Add rowValues
+End Sub
+
+Private Sub AppendBufferedRows(ByVal sourceBuffer As Collection, ByVal targetBuffer As Collection)
+    Dim rowIndex As Long
+    For rowIndex = 1 To sourceBuffer.Count
+        targetBuffer.Add sourceBuffer(rowIndex)
+    Next rowIndex
+End Sub
+
+Private Sub FlushBufferedRows( _
+    ByRef rowBuffer As Collection, _
+    ByVal targetSheet As Worksheet, _
+    ByVal columnCount As Long, _
+    ByRef nextRow As Long)
+
+    If rowBuffer.Count = 0 Then
+        Exit Sub
+    End If
+
+    If nextRow + rowBuffer.Count - 1 > targetSheet.Rows.Count Then
+        Err.Raise vbObjectError + 102, "FlushBufferedRows", "The output sheet row limit was exceeded: " & targetSheet.Name
+    End If
+
+    Dim data() As Variant
+    ReDim data(1 To rowBuffer.Count, 1 To columnCount)
+
+    Dim rowIndex As Long
+    Dim columnIndex As Long
+    Dim rowValues As Variant
+
+    For rowIndex = 1 To rowBuffer.Count
+        rowValues = rowBuffer(rowIndex)
+        For columnIndex = 1 To columnCount
+            data(rowIndex, columnIndex) = rowValues(columnIndex - 1)
+        Next columnIndex
+    Next rowIndex
+
+    targetSheet.Cells(nextRow, 1).Resize(rowBuffer.Count, columnCount).Value2 = data
+    nextRow = nextRow + rowBuffer.Count
+    Set rowBuffer = New Collection
+End Sub
 
 Private Function SheetTableListName() As String
     SheetTableListName = TextFromCodePoints("12486 12540 12502 12523 19968 35239")
