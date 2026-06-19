@@ -3,7 +3,9 @@ Option Explicit
 
 Private Const ERROR_VALUE As String = "ERROR"
 Private Const SEARCH_FORMULA_LAST_ROW As Long = 1000
-Private Const OUTPUT_FLUSH_ROW_COUNT As Long = 5000
+Private Const OUTPUT_FLUSH_ROW_COUNT As Long = 1000
+Private Const COLUMN_READ_CHUNK_ROW_COUNT As Long = 500
+Private Const FORMAT_AUTOFIT_SAMPLE_ROW_COUNT As Long = 2000
 Private Const SCAN_YIELD_INTERVAL As Long = 100
 Private Const WORKBOOK_YIELD_INTERVAL As Long = 10
 
@@ -231,7 +233,7 @@ Private Sub ProcessWorkbookFiles( _
     Dim index As Long
     For index = 1 To targetFiles.Count
         Application.StatusBar = "Analyzing " & CStr(index) & " / " & CStr(targetFiles.Count) & ": " & CStr(targetFiles(index))
-        ProcessWorkbook CStr(targetFiles(index)), tableRows, columnRows, stats
+        ProcessWorkbook CStr(targetFiles(index)), tableRows, columnRows, tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
 
         If tableRows.Count >= OUTPUT_FLUSH_ROW_COUNT Then
             FlushBufferedRows tableRows, tableListSheet, 3, nextTableRow
@@ -253,16 +255,16 @@ End Sub
 
 Private Sub ProcessWorkbook( _
     ByVal workbookPath As String, _
-    ByVal tableRows As Collection, _
-    ByVal columnRows As Collection, _
+    ByRef tableRows As Collection, _
+    ByRef columnRows As Collection, _
+    ByVal tableListSheet As Worksheet, _
+    ByVal columnListSheet As Worksheet, _
+    ByRef nextTableRow As Long, _
+    ByRef nextColumnRow As Long, _
     ByRef stats As RunStats)
 
     Dim sourceBook As Workbook
     Dim sourceSheet As Worksheet
-    Dim workbookTableRows As Collection
-    Dim workbookColumnRows As Collection
-    Set workbookTableRows = New Collection
-    Set workbookColumnRows = New Collection
 
     On Error GoTo WorkbookError
     Set sourceBook = Workbooks.Open( _
@@ -289,12 +291,10 @@ Private Sub ProcessWorkbook( _
     Dim tableId As String
     ParseSheetName sourceSheet.Name, japaneseTableName, tableId
 
-    AddBufferedRow workbookTableRows, englishTableName, japaneseTableName, tableId
+    CollectColumnRows sourceSheet, columnRows, columnListSheet, englishTableName, nextColumnRow
 
-    CollectColumnRows sourceSheet, workbookColumnRows, englishTableName
-
-    AppendBufferedRows workbookTableRows, tableRows
-    AppendBufferedRows workbookColumnRows, columnRows
+    AddBufferedRow tableRows, englishTableName, japaneseTableName, tableId
+    FlushBufferedRowsIfNeeded tableRows, tableListSheet, 3, nextTableRow
 
     stats.ProcessedWorkbookCount = stats.ProcessedWorkbookCount + 1
 
@@ -359,8 +359,10 @@ End Function
 
 Private Sub CollectColumnRows( _
     ByVal sourceSheet As Worksheet, _
-    ByVal columnRows As Collection, _
-    ByVal englishTableName As String)
+    ByRef columnRows As Collection, _
+    ByVal columnListSheet As Worksheet, _
+    ByVal englishTableName As String, _
+    ByRef nextColumnRow As Long)
 
     Dim fieldHeaderCell As Range
     Set fieldHeaderCell = FindFieldHeaderCell(sourceSheet)
@@ -381,24 +383,37 @@ Private Sub CollectColumnRows( _
         Exit Sub
     End If
 
+    Dim chunkStartRow As Long
+    Dim chunkEndRow As Long
     Dim values As Variant
-    values = sourceSheet.Range(sourceSheet.Cells(headerRow + 1, fieldColumn), sourceSheet.Cells(lastRow, japaneseColumn)).Value2
-
     Dim rowIndex As Long
     Dim fieldName As String
     Dim japaneseName As String
-    For rowIndex = 1 To UBound(values, 1)
-        fieldName = TrimCellText(values(rowIndex, 1))
-        If Len(fieldName) > 0 Then
-            japaneseName = TrimCellText(values(rowIndex, 2))
-            AddBufferedRow columnRows, englishTableName, fieldName, japaneseName, BuildColumnLookupKey(englishTableName, fieldName)
+
+    For chunkStartRow = headerRow + 1 To lastRow Step COLUMN_READ_CHUNK_ROW_COUNT
+        chunkEndRow = chunkStartRow + COLUMN_READ_CHUNK_ROW_COUNT - 1
+        If chunkEndRow > lastRow Then
+            chunkEndRow = lastRow
         End If
-    Next rowIndex
+
+        values = sourceSheet.Range(sourceSheet.Cells(chunkStartRow, fieldColumn), sourceSheet.Cells(chunkEndRow, japaneseColumn)).Value2
+
+        For rowIndex = 1 To UBound(values, 1)
+            fieldName = TrimCellText(values(rowIndex, 1))
+            If Len(fieldName) > 0 Then
+                japaneseName = TrimCellText(values(rowIndex, 2))
+                AddBufferedRow columnRows, englishTableName, fieldName, japaneseName, BuildColumnLookupKey(englishTableName, fieldName)
+            End If
+        Next rowIndex
+
+        values = Empty
+        FlushBufferedRowsIfNeeded columnRows, columnListSheet, 4, nextColumnRow
+    Next chunkStartRow
 End Sub
 
 Private Function FindFieldHeaderCell(ByVal sourceSheet As Worksheet) As Range
     Dim searchRange As Range
-    Set searchRange = sourceSheet.UsedRange
+    Set searchRange = sourceSheet.Cells
 
     Dim foundCell As Range
     Set foundCell = searchRange.Find( _
@@ -435,13 +450,30 @@ Private Function LastNonEmptyRowInColumns(ByVal sourceSheet As Worksheet, ByVal 
     Dim firstLastRow As Long
     Dim secondLastRow As Long
 
-    firstLastRow = sourceSheet.Cells(sourceSheet.Rows.Count, firstColumn).End(xlUp).Row
-    secondLastRow = sourceSheet.Cells(sourceSheet.Rows.Count, secondColumn).End(xlUp).Row
+    firstLastRow = LastNonEmptyRowInColumn(sourceSheet, firstColumn)
+    secondLastRow = LastNonEmptyRowInColumn(sourceSheet, secondColumn)
 
     If firstLastRow > secondLastRow Then
         LastNonEmptyRowInColumns = firstLastRow
     Else
         LastNonEmptyRowInColumns = secondLastRow
+    End If
+End Function
+
+Private Function LastNonEmptyRowInColumn(ByVal sourceSheet As Worksheet, ByVal columnIndex As Long) As Long
+    Dim foundCell As Range
+    Set foundCell = sourceSheet.Columns(columnIndex).Find( _
+        What:="*", _
+        LookIn:=xlValues, _
+        LookAt:=xlPart, _
+        SearchOrder:=xlByRows, _
+        SearchDirection:=xlPrevious, _
+        MatchCase:=False)
+
+    If foundCell Is Nothing Then
+        LastNonEmptyRowInColumn = 0
+    Else
+        LastNonEmptyRowInColumn = foundCell.Row
     End If
 End Function
 
@@ -738,13 +770,6 @@ Private Sub AddBufferedRow(ByVal rowBuffer As Collection, ParamArray values() As
     rowBuffer.Add rowValues
 End Sub
 
-Private Sub AppendBufferedRows(ByVal sourceBuffer As Collection, ByVal targetBuffer As Collection)
-    Dim rowIndex As Long
-    For rowIndex = 1 To sourceBuffer.Count
-        targetBuffer.Add sourceBuffer(rowIndex)
-    Next rowIndex
-End Sub
-
 Private Sub FlushBufferedRows( _
     ByRef rowBuffer As Collection, _
     ByVal targetSheet As Worksheet, _
@@ -776,6 +801,17 @@ Private Sub FlushBufferedRows( _
     targetSheet.Cells(nextRow, 1).Resize(rowBuffer.Count, columnCount).Value2 = data
     nextRow = nextRow + rowBuffer.Count
     Set rowBuffer = New Collection
+End Sub
+
+Private Sub FlushBufferedRowsIfNeeded( _
+    ByRef rowBuffer As Collection, _
+    ByVal targetSheet As Worksheet, _
+    ByVal columnCount As Long, _
+    ByRef nextRow As Long)
+
+    If rowBuffer.Count >= OUTPUT_FLUSH_ROW_COUNT Then
+        FlushBufferedRows rowBuffer, targetSheet, columnCount, nextRow
+    End If
 End Sub
 
 Private Function SheetTableListName() As String
@@ -844,12 +880,39 @@ Private Sub FormatOutputSheet(ByVal sheet As Worksheet)
         .Interior.Color = RGB(221, 235, 247)
     End With
 
-    sheet.Columns("A:C").AutoFit
+    Dim lastRow As Long
+    lastRow = LastUsedRowInSheet(sheet)
+    If lastRow < 1 Then
+        lastRow = 1
+    End If
+
+    If lastRow > FORMAT_AUTOFIT_SAMPLE_ROW_COUNT Then
+        lastRow = FORMAT_AUTOFIT_SAMPLE_ROW_COUNT
+    End If
+
+    sheet.Range(sheet.Cells(1, 1), sheet.Cells(lastRow, 3)).Columns.AutoFit
     If sheet.AutoFilterMode Then
         sheet.AutoFilterMode = False
     End If
     sheet.Range("A1:C1").AutoFilter
 End Sub
+
+Private Function LastUsedRowInSheet(ByVal sheet As Worksheet) As Long
+    Dim foundCell As Range
+    Set foundCell = sheet.Cells.Find( _
+        What:="*", _
+        LookIn:=xlFormulas, _
+        LookAt:=xlPart, _
+        SearchOrder:=xlByRows, _
+        SearchDirection:=xlPrevious, _
+        MatchCase:=False)
+
+    If foundCell Is Nothing Then
+        LastUsedRowInSheet = 0
+    Else
+        LastUsedRowInSheet = foundCell.Row
+    End If
+End Function
 
 Private Function BuildCompletionMessage(ByRef stats As RunStats) As String
     BuildCompletionMessage = _
