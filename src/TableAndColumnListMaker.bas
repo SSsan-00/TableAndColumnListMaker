@@ -3,11 +3,13 @@ Option Explicit
 
 Private Const ERROR_VALUE As String = "ERROR"
 Private Const SEARCH_FORMULA_LAST_ROW As Long = 1000
-Private Const OUTPUT_FLUSH_ROW_COUNT As Long = 1000
+Private Const OUTPUT_FLUSH_ROW_COUNT As Long = 100
 Private Const COLUMN_READ_CHUNK_ROW_COUNT As Long = 500
 Private Const FORMAT_AUTOFIT_SAMPLE_ROW_COUNT As Long = 2000
 Private Const SCAN_YIELD_INTERVAL As Long = 100
 Private Const WORKBOOK_YIELD_INTERVAL As Long = 10
+Private Const CHECKPOINT_WORKBOOK_INTERVAL As Long = 25
+Private Const CHECKPOINT_COLUMN_FLUSH_INTERVAL As Long = 10
 
 Private Type RunStats
     ScannedFileCount As Long
@@ -15,6 +17,8 @@ Private Type RunStats
     ProcessedWorkbookCount As Long
     SkippedWorkbookCount As Long
     SkippedFolderCount As Long
+    CheckpointSaveCount As Long
+    CheckpointSaveFailureCount As Long
     TableCount As Long
     ColumnCount As Long
 End Type
@@ -92,7 +96,7 @@ Public Sub RunTableAndColumnListMakerForFolder(ByVal targetFolder As String, Opt
     Dim targetFiles As Collection
     Set targetFiles = CollectTargetWorkbookFiles(targetFolder, stats)
 
-    ProcessWorkbookFiles targetFiles, tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
+    ProcessWorkbookFiles targetFiles, outputBook, tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
 
     stats.TableCount = nextTableRow - 2
     stats.ColumnCount = nextColumnRow - 2
@@ -112,6 +116,11 @@ CleanExit:
     Application.DisplayAlerts = oldDisplayAlerts
     Application.EnableEvents = oldEnableEvents
     Application.ScreenUpdating = oldScreenUpdating
+
+    If Err.Number = 0 Then
+        CheckpointOutputWorkbook outputBook, stats, "Saving final output..."
+        Application.StatusBar = oldStatusBar
+    End If
 
     If Err.Number = 0 And showCompletionMessage Then
         MsgBox BuildCompletionMessage(stats), vbInformation, "TableAndColumnListMaker"
@@ -219,6 +228,7 @@ End Function
 
 Private Sub ProcessWorkbookFiles( _
     ByVal targetFiles As Collection, _
+    ByVal outputBook As Workbook, _
     ByVal tableListSheet As Worksheet, _
     ByVal columnListSheet As Worksheet, _
     ByRef nextTableRow As Long, _
@@ -233,14 +243,13 @@ Private Sub ProcessWorkbookFiles( _
     Dim index As Long
     For index = 1 To targetFiles.Count
         Application.StatusBar = "Analyzing " & CStr(index) & " / " & CStr(targetFiles.Count) & ": " & CStr(targetFiles(index))
-        ProcessWorkbook CStr(targetFiles(index)), tableRows, columnRows, tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
+        ProcessWorkbook CStr(targetFiles(index)), outputBook, tableRows, columnRows, tableListSheet, columnListSheet, nextTableRow, nextColumnRow, stats
 
-        If tableRows.Count >= OUTPUT_FLUSH_ROW_COUNT Then
-            FlushBufferedRows tableRows, tableListSheet, 3, nextTableRow
-        End If
+        FlushBufferedRows tableRows, tableListSheet, 3, nextTableRow
+        FlushBufferedRows columnRows, columnListSheet, 4, nextColumnRow
 
-        If columnRows.Count >= OUTPUT_FLUSH_ROW_COUNT Then
-            FlushBufferedRows columnRows, columnListSheet, 4, nextColumnRow
+        If index Mod CHECKPOINT_WORKBOOK_INTERVAL = 0 Then
+            CheckpointOutputWorkbook outputBook, stats, "Saving progress: " & CStr(index) & " / " & CStr(targetFiles.Count)
         End If
 
         If index Mod WORKBOOK_YIELD_INTERVAL = 0 Then
@@ -255,6 +264,7 @@ End Sub
 
 Private Sub ProcessWorkbook( _
     ByVal workbookPath As String, _
+    ByVal outputBook As Workbook, _
     ByRef tableRows As Collection, _
     ByRef columnRows As Collection, _
     ByVal tableListSheet As Worksheet, _
@@ -291,7 +301,7 @@ Private Sub ProcessWorkbook( _
     Dim tableId As String
     ParseSheetName sourceSheet.Name, japaneseTableName, tableId
 
-    CollectColumnRows sourceSheet, columnRows, columnListSheet, englishTableName, nextColumnRow
+    CollectColumnRows sourceSheet, outputBook, columnRows, columnListSheet, englishTableName, nextColumnRow, stats
 
     AddBufferedRow tableRows, englishTableName, japaneseTableName, tableId
     FlushBufferedRowsIfNeeded tableRows, tableListSheet, 3, nextTableRow
@@ -359,10 +369,12 @@ End Function
 
 Private Sub CollectColumnRows( _
     ByVal sourceSheet As Worksheet, _
+    ByVal outputBook As Workbook, _
     ByRef columnRows As Collection, _
     ByVal columnListSheet As Worksheet, _
     ByVal englishTableName As String, _
-    ByRef nextColumnRow As Long)
+    ByRef nextColumnRow As Long, _
+    ByRef stats As RunStats)
 
     Dim fieldHeaderCell As Range
     Set fieldHeaderCell = FindFieldHeaderCell(sourceSheet)
@@ -389,6 +401,7 @@ Private Sub CollectColumnRows( _
     Dim rowIndex As Long
     Dim fieldName As String
     Dim japaneseName As String
+    Dim chunkFlushCount As Long
 
     For chunkStartRow = headerRow + 1 To lastRow Step COLUMN_READ_CHUNK_ROW_COUNT
         chunkEndRow = chunkStartRow + COLUMN_READ_CHUNK_ROW_COUNT - 1
@@ -407,7 +420,12 @@ Private Sub CollectColumnRows( _
         Next rowIndex
 
         values = Empty
-        FlushBufferedRowsIfNeeded columnRows, columnListSheet, 4, nextColumnRow
+        If FlushBufferedRowsIfNeeded(columnRows, columnListSheet, 4, nextColumnRow) Then
+            chunkFlushCount = chunkFlushCount + 1
+            If chunkFlushCount Mod CHECKPOINT_COLUMN_FLUSH_INTERVAL = 0 Then
+                CheckpointOutputWorkbook outputBook, stats, "Saving progress inside workbook..."
+            End If
+        End If
     Next chunkStartRow
 End Sub
 
@@ -803,15 +821,42 @@ Private Sub FlushBufferedRows( _
     Set rowBuffer = New Collection
 End Sub
 
-Private Sub FlushBufferedRowsIfNeeded( _
+Private Function FlushBufferedRowsIfNeeded( _
     ByRef rowBuffer As Collection, _
     ByVal targetSheet As Worksheet, _
     ByVal columnCount As Long, _
-    ByRef nextRow As Long)
+    ByRef nextRow As Long) As Boolean
 
     If rowBuffer.Count >= OUTPUT_FLUSH_ROW_COUNT Then
         FlushBufferedRows rowBuffer, targetSheet, columnCount, nextRow
+        FlushBufferedRowsIfNeeded = True
     End If
+End Function
+
+Private Sub CheckpointOutputWorkbook( _
+    ByVal outputBook As Workbook, _
+    ByRef stats As RunStats, _
+    ByVal statusText As String)
+
+    If Len(outputBook.Path) = 0 Then
+        Exit Sub
+    End If
+
+    If outputBook.ReadOnly Then
+        Exit Sub
+    End If
+
+    On Error GoTo SaveError
+    Application.StatusBar = statusText
+    outputBook.Save
+    stats.CheckpointSaveCount = stats.CheckpointSaveCount + 1
+    DoEvents
+    Exit Sub
+
+SaveError:
+    stats.CheckpointSaveFailureCount = stats.CheckpointSaveFailureCount + 1
+    Debug.Print "Checkpoint save failed: " & Err.Description
+    Err.Clear
 End Sub
 
 Private Function SheetTableListName() As String
@@ -922,6 +967,8 @@ Private Function BuildCompletionMessage(ByRef stats As RunStats) As String
         "Processed workbooks: " & CStr(stats.ProcessedWorkbookCount) & vbCrLf & _
         "Skipped workbooks: " & CStr(stats.SkippedWorkbookCount) & vbCrLf & _
         "Skipped folders: " & CStr(stats.SkippedFolderCount) & vbCrLf & _
+        "Checkpoint saves: " & CStr(stats.CheckpointSaveCount) & vbCrLf & _
+        "Checkpoint save failures: " & CStr(stats.CheckpointSaveFailureCount) & vbCrLf & _
         "Table rows: " & CStr(stats.TableCount) & vbCrLf & _
         "Column rows: " & CStr(stats.ColumnCount)
 End Function
